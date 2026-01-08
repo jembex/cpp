@@ -2,33 +2,31 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# Storage for chat and admin alerts
 chat_history = []
 admin_alerts = []
 
 @app.route('/join', methods=['POST'])
 def join():
-    # Capture the client's IP address
-    client_ip = request.remote_addr 
-    user = request.json.get("user", "Unknown")
-    
-    # Create an alert for the Admin
-    alert = f"ALERT: User '{user}' joined from IP: {client_ip}"
-    admin_alerts.append(alert)
-    
-    return jsonify({"status": "joined", "ip": client_ip})
+    user = request.json.get("user", "Guest")
+    client_ip = request.remote_addr
+    # Send a notification to the Admin only
+    admin_alerts.append(f"JOINED: {user} (IP: {client_ip})")
+    return jsonify({"status": "ok"})
 
-@app.route('/send', methods=['POST'])
-def send():
-    data = request.json
-    chat_history.append({"user": data['user'], "message": data['message']})
-    return jsonify({"status": "success"})
+@app.route('/chat', methods=['GET', 'POST'])
+def handle_chat():
+    if request.method == 'POST':
+        # Add new message to the history
+        chat_history.append(request.json)
+        return jsonify({"status": "sent"})
+    # Send full chat history back to the client
+    return jsonify(chat_history)
 
-@app.route('/admin/alerts', methods=['GET'])
-def get_alerts():
-    # Return all alerts and clear the list so admin only sees new ones
+@app.route('/admin/view', methods=['GET'])
+def admin_view():
+    # Admin checks this to see join notifications
     alerts = list(admin_alerts)
-    admin_alerts.clear()
+    admin_alerts.clear() # Clear after reading
     return jsonify(alerts)
 
 if __name__ == '__main__':
