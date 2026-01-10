@@ -148,6 +148,51 @@ def upload_file():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# --- Chat Endpoints ---
+
+@app.route('/api/chat/send', methods=['POST'])
+def chat_send():
+    """Receive chat message from Client or Admin"""
+    data = request.json or {}
+    client_id = data.get('id') or data.get('target_id') # Client uses 'id', Admin uses 'target_id'
+    sender = data.get('sender') # 'client' or 'admin'
+    message = data.get('message')
+    
+    if not client_id or client_id not in clients:
+        return jsonify({"error": "Unknown client"}), 404
+        
+    msg_obj = {
+        "sender": sender,
+        "message": message,
+        "timestamp": time.time()
+    }
+    
+    # Init chat history if needed
+    if 'chat' not in clients[client_id]:
+        clients[client_id]['chat'] = []
+        
+    clients[client_id]['chat'].append(msg_obj)
+    
+    # If sent by Admin, allow Client to pick it up via command? 
+    # Or better: Client polls specifically for chat if chat is open?
+    # For now, let's keep it simple: Admin queues a 'chat_msg' command for immediate push
+    if sender == 'admin':
+        cmd_id = str(uuid.uuid4())[:8]
+        clients[client_id]['command_queue'].append({
+            "id": cmd_id,
+            "type": "chat_msg",
+            "params": message
+        })
+        
+    return jsonify({"status": "sent"})
+
+@app.route('/api/chat/history/<client_id>', methods=['GET'])
+def chat_history(client_id):
+    """Get chat history"""
+    if client_id in clients:
+        return jsonify(clients[client_id].get('chat', []))
+    return jsonify([])
+
 # --- Admin API Endpoints ---
 
 @app.route('/admin/list', methods=['GET'])
