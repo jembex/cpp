@@ -63,39 +63,43 @@ USER_LOG_FILE = os.path.join(USER_LOG_DIR, 'saves.json')
 if not os.path.exists(USER_LOG_DIR):
     os.makedirs(USER_LOG_DIR)
 
-# --- Helpers ---   
+# --- Helpers ---
+
+def _fmt_time(dt):
+    """Format a UTC datetime as 12-hour AM/PM string."""
+    return dt.strftime("%B %d, %Y %I:%M:%S %p") + " UTC"
 
 def log_user_registration(client_id, ip):
-    """Log user registration to MongoDB and a local JSON file"""
-    # Timestamp when the user joined
+    """Log user join to MongoDB and local JSON file."""
     joined_at = datetime.now(timezone.utc)
-    # Human-readable 12-hour AM/PM format e.g. "March 01, 2026 08:36:29 AM"
-    joined_at_str = joined_at.strftime("%B %d, %Y %I:%M:%S %p") + " UTC"
+    joined_time_str = _fmt_time(joined_at)
 
     # --- Save to MongoDB ---
     if MONGO_ENABLED and clients_collection is not None:
         try:
-            # Upsert: insert if new client, skip if already exists
+            # Always update join info (even for returning clients)
             result = clients_collection.update_one(
                 {"client_id": client_id},
                 {
-                    "$setOnInsert": {
-                        "client_id": client_id,
-                        "ip": ip,
-                        "joined_at": joined_at,       # raw datetime (for sorting/querying)
-                        "joined_time": joined_at_str  # e.g. "March 01, 2026 08:36:29 AM UTC"
+                    "$set": {
+                        "client_id":          client_id,
+                        "ip":                 ip,
+                        "joined_at":          joined_at,       # raw UTC datetime
+                        "joined_time":        joined_time_str, # e.g. "March 01, 2026 08:52:00 AM UTC"
+                        "disconnected_time":  None,            # reset on reconnect
+                        "disconnected_at":    None
                     }
                 },
                 upsert=True
             )
             if result.upserted_id:
-                print(f"[+] MongoDB: New client {client_id} saved (joined at {joined_at_str})")
+                print(f"[+] MongoDB: Client {client_id} first join saved ({joined_time_str})")
             else:
-                print(f"[~] MongoDB: Client {client_id} already exists, join time preserved.")
+                print(f"[+] MongoDB: Client {client_id} reconnected, join time updated ({joined_time_str})")
         except Exception as e:
             print(f"[-] MongoDB write error: {e}")
 
-    # --- Save to local JSON (fallback / backup) ---
+    # --- Save to local JSON ---
     try:
         log_data = []
         if os.path.exists(USER_LOG_FILE):
@@ -105,20 +109,76 @@ def log_user_registration(client_id, ip):
                 except (json.JSONDecodeError, FileNotFoundError):
                     log_data = []
 
-        log_data.append({
-            "client_id": client_id,
-            "ip": ip,
-            "joined_time": joined_at_str
-        })
+        # Update existing entry or append new one
+        existing = next((x for x in log_data if x.get("client_id") == client_id), None)
+        if existing:
+            existing["ip"]              = ip
+            existing["joined_time"]     = joined_time_str
+            existing["disconnected_time"] = None
+        else:
+            log_data.append({
+                "client_id":          client_id,
+                "ip":                 ip,
+                "joined_time":        joined_time_str,
+                "disconnected_time":  None
+            })
 
         with open(USER_LOG_FILE, 'w') as f:
             json.dump(log_data, f, indent=4)
-        print(f"[#] Logged user {client_id} to {USER_LOG_FILE}")
+        print(f"[#] Logged user {client_id} join to {USER_LOG_FILE}")
     except Exception as e:
         print(f"[-] Error saving to json: {e}")
 
+
+def log_user_disconnection(client_id):
+    """Log when a client goes offline — write disconnected time to MongoDB and JSON."""
+    disconnected_at = datetime.now(timezone.utc)
+    disconnected_time_str = _fmt_time(disconnected_at)
+
+    # --- Update MongoDB ---
+    if MONGO_ENABLED and clients_collection is not None:
+        try:
+            clients_collection.update_one(
+                {"client_id": client_id},
+                {
+                    "$set": {
+                        "disconnected_at":   disconnected_at,
+                        "disconnected_time": disconnected_time_str
+                    }
+                }
+            )
+            print(f"[x] MongoDB: Client {client_id} disconnected at {disconnected_time_str}")
+        except Exception as e:
+            print(f"[-] MongoDB disconnect write error: {e}")
+
+    # --- Update local JSON ---
+    try:
+        log_data = []
+        if os.path.exists(USER_LOG_FILE):
+            with open(USER_LOG_FILE, 'r') as f:
+                try:
+                    log_data = json.load(f)
+                except (json.JSONDecodeError, FileNotFoundError):
+                    log_data = []
+
+        existing = next((x for x in log_data if x.get("client_id") == client_id), None)
+        if existing:
+            existing["disconnected_time"] = disconnected_time_str
+        else:
+            log_data.append({
+                "client_id":         client_id,
+                "disconnected_time": disconnected_time_str
+            })
+
+        with open(USER_LOG_FILE, 'w') as f:
+            json.dump(log_data, f, indent=4)
+        print(f"[#] Logged user {client_id} disconnect to {USER_LOG_FILE}")
+    except Exception as e:
+        print(f"[-] Error saving disconnect to json: {e}")
+
+
 def clean_clients():
-    """Remove dead clients (inactive > 60s)"""
+    """Remove dead clients (inactive > 60s) and log their disconnect time."""
     with clients_lock:
         now = time.time()
         dead = []
@@ -127,9 +187,12 @@ def clean_clients():
                 dead.append(cid)
         for d in dead:
             del clients[d]
-            # Also clean up streaming state for dead clients
+            # Clean up streaming state
             if d in streaming_clients:
                 del streaming_clients[d]
+            # Record disconnect time in MongoDB and JSON
+            log_user_disconnection(d)
+
 
 # --- Client API Endpoints ---
 
@@ -164,6 +227,28 @@ def register():
     print(f"[+] Client registered: {client_id} from {public_ip}")
     log_user_registration(client_id, public_ip)
     return jsonify({"id": client_id, "status": "registered"})
+
+@app.route('/api/disconnect', methods=['POST'])
+def disconnect():
+    """Client explicitly notifies server it is going offline"""
+    data = request.json or {}
+    client_id = data.get('id')
+
+    if not client_id:
+        return jsonify({"error": "No client id provided"}), 400
+
+    # Remove from active clients
+    with clients_lock:
+        if client_id in clients:
+            del clients[client_id]
+        if client_id in streaming_clients:
+            del streaming_clients[client_id]
+
+    # Save the exact disconnect time to MongoDB and JSON right now
+    log_user_disconnection(client_id)
+    print(f"[x] Client {client_id} disconnected (explicit)")
+    return jsonify({"status": "disconnected"})
+
 
 @app.route('/api/poll', methods=['POST'])
 def poll():
