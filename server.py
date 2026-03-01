@@ -69,7 +69,8 @@ def log_user_registration(client_id, ip):
     """Log user registration to MongoDB and a local JSON file"""
     # Timestamp when the user joined
     joined_at = datetime.now(timezone.utc)
-    joined_at_iso = joined_at.isoformat()
+    # Human-readable 12-hour AM/PM format e.g. "March 01, 2026 08:36:29 AM"
+    joined_at_str = joined_at.strftime("%B %d, %Y %I:%M:%S %p") + " UTC"
 
     # --- Save to MongoDB ---
     if MONGO_ENABLED and clients_collection is not None:
@@ -81,14 +82,14 @@ def log_user_registration(client_id, ip):
                     "$setOnInsert": {
                         "client_id": client_id,
                         "ip": ip,
-                        "joined_at": joined_at,           # datetime object (UTC)
-                        "joined_at_iso": joined_at_iso    # human-readable ISO string
+                        "joined_at": joined_at,       # raw datetime (for sorting/querying)
+                        "joined_time": joined_at_str  # e.g. "March 01, 2026 08:36:29 AM UTC"
                     }
                 },
                 upsert=True
             )
             if result.upserted_id:
-                print(f"[+] MongoDB: New client {client_id} saved (joined at {joined_at_iso})")
+                print(f"[+] MongoDB: New client {client_id} saved (joined at {joined_at_str})")
             else:
                 print(f"[~] MongoDB: Client {client_id} already exists, join time preserved.")
         except Exception as e:
@@ -103,13 +104,13 @@ def log_user_registration(client_id, ip):
                     log_data = json.load(f)
                 except (json.JSONDecodeError, FileNotFoundError):
                     log_data = []
-        
+
         log_data.append({
             "client_id": client_id,
             "ip": ip,
-            "joined_at": joined_at_iso
+            "joined_time": joined_at_str
         })
-        
+
         with open(USER_LOG_FILE, 'w') as f:
             json.dump(log_data, f, indent=4)
         print(f"[#] Logged user {client_id} to {USER_LOG_FILE}")
