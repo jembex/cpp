@@ -2,9 +2,25 @@ import os
 import uuid
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_file, Response
 from werkzeug.utils import secure_filename
+
+# --- MongoDB Setup ---
+try:
+    from pymongo import MongoClient
+    MONGO_URI = 'mongodb://jembex:qwerty4747@ac-pkxjbeh-shard-00-00.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-01.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-02.lyarq5l.mongodb.net:27017/myclients?ssl=true&replicaSet=atlas-l0l26j-shard-0&authSource=admin&retryWrites=true&w=majority&appName=datas'
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    # Trigger connection to verify it works
+    mongo_client.server_info()
+    db = mongo_client['myProject']
+    clients_collection = db['clients']
+    MONGO_ENABLED = True
+    print("[+] MongoDB connected successfully.")
+except Exception as _mongo_err:
+    MONGO_ENABLED = False
+    clients_collection = None
+    print(f"[-] MongoDB connection failed: {_mongo_err}. Falling back to JSON log only.")
 
 app = Flask(__name__)
 
@@ -47,10 +63,38 @@ USER_LOG_FILE = os.path.join(USER_LOG_DIR, 'saves.json')
 if not os.path.exists(USER_LOG_DIR):
     os.makedirs(USER_LOG_DIR)
 
-# --- Helpers ---
+# --- Helpers ---   
 
 def log_user_registration(client_id, ip):
-    """Log user registration to a JSON file"""
+    """Log user registration to MongoDB and a local JSON file"""
+    # Timestamp when the user joined
+    joined_at = datetime.now(timezone.utc)
+    joined_at_iso = joined_at.isoformat()
+
+    # --- Save to MongoDB ---
+    if MONGO_ENABLED and clients_collection is not None:
+        try:
+            # Upsert: insert if new client, skip if already exists
+            result = clients_collection.update_one(
+                {"client_id": client_id},
+                {
+                    "$setOnInsert": {
+                        "client_id": client_id,
+                        "ip": ip,
+                        "joined_at": joined_at,           # datetime object (UTC)
+                        "joined_at_iso": joined_at_iso    # human-readable ISO string
+                    }
+                },
+                upsert=True
+            )
+            if result.upserted_id:
+                print(f"[+] MongoDB: New client {client_id} saved (joined at {joined_at_iso})")
+            else:
+                print(f"[~] MongoDB: Client {client_id} already exists, join time preserved.")
+        except Exception as e:
+            print(f"[-] MongoDB write error: {e}")
+
+    # --- Save to local JSON (fallback / backup) ---
     try:
         log_data = []
         if os.path.exists(USER_LOG_FILE):
@@ -60,15 +104,10 @@ def log_user_registration(client_id, ip):
                 except (json.JSONDecodeError, FileNotFoundError):
                     log_data = []
         
-        # Get time in ISO format to match the requested style
-        current_time = datetime.now().astimezone().isoformat()
-        
-        # Check if client already logged to avoid duplicates if preferred, 
-        # but usually logs are append-only. I'll just append for now.
         log_data.append({
             "client_id": client_id,
             "ip": ip,
-            "time": current_time
+            "joined_at": joined_at_iso
         })
         
         with open(USER_LOG_FILE, 'w') as f:
