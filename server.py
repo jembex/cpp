@@ -6,20 +6,39 @@ from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_file, Response
 from werkzeug.utils import secure_filename
 
-# --- MongoDB Setup ---
-try:
-    from pymongo import MongoClient
-    MONGO_URI = 'mongodb://jembex:qwerty4747@ac-pkxjbeh-shard-00-00.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-01.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-02.lyarq5l.mongodb.net:27017/myclients?ssl=true&replicaSet=atlas-l0l26j-shard-0&authSource=admin&retryWrites=true&w=majority&appName=datas'
-    # Use a longer timeout; pymongo connects lazily on first write (no blocking call here)
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=15000)
-    db = mongo_client['myclients']
-    clients_collection = db['clients']
-    MONGO_ENABLED = True
-    print("[+] MongoDB client initialised (will connect on first write).")
-except Exception as _mongo_err:
-    MONGO_ENABLED = False
-    clients_collection = None
-    print(f"[-] MongoDB setup failed: {_mongo_err}. Falling back to JSON log only.")
+# MongoDB URI
+MONGO_URI = 'mongodb://jembex:qwerty4747@ac-pkxjbeh-shard-00-00.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-01.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-02.lyarq5l.mongodb.net:27017/myclients?ssl=true&replicaSet=atlas-l0l26j-shard-0&authSource=admin&retryWrites=true&w=majority&appName=datas'
+
+def save_to_mongodb(document: dict, operation: str = "upsert"):
+    """
+    Always creates a fresh MongoDB connection and saves the document.
+    operation: 'upsert' (join) or 'update' (disconnect).
+    """
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=15000)
+        col = client['myclients']['clients']
+
+        if operation == "upsert":
+            result = col.update_one(
+                {"client_id": document["client_id"]},
+                {"$set": document},
+                upsert=True
+            )
+            client.close()
+            return result.upserted_id or result.modified_count
+        elif operation == "update":
+            result = col.update_one(
+                {"client_id": document["client_id"]},
+                {"$set": document}
+            )
+            client.close()
+            return result.modified_count
+    except Exception as e:
+        print(f"[-] MongoDB save_to_mongodb error: {e}")
+        return None
+
+
 
 
 app = Flask(__name__)
@@ -74,30 +93,20 @@ def log_user_registration(client_id, ip):
     joined_at = datetime.now(timezone.utc)
     joined_time_str = _fmt_time(joined_at)
 
-    # --- Save to MongoDB ---
-    if MONGO_ENABLED and clients_collection is not None:
-        try:
-            # Always update join info (even for returning clients)
-            result = clients_collection.update_one(
-                {"client_id": client_id},
-                {
-                    "$set": {
-                        "client_id":          client_id,
-                        "ip":                 ip,
-                        "joined_at":          joined_at,       # raw UTC datetime
-                        "joined_time":        joined_time_str, # e.g. "March 01, 2026 08:52:00 AM UTC"
-                        "disconnected_time":  None,            # reset on reconnect
-                        "disconnected_at":    None
-                    }
-                },
-                upsert=True
-            )
-            if result.upserted_id:
-                print(f"[+] MongoDB: Client {client_id} first join saved ({joined_time_str})")
-            else:
-                print(f"[+] MongoDB: Client {client_id} reconnected, join time updated ({joined_time_str})")
-        except Exception as e:
-            print(f"[-] MongoDB write error: {e}")
+    # --- Save to MongoDB (always attempts, own connection) ---
+    result = save_to_mongodb({
+        "client_id":         client_id,
+        "ip":                ip,
+        "joined_at":         joined_at,
+        "joined_time":       joined_time_str,
+        "disconnected_time": None,
+        "disconnected_at":   None
+    }, operation="upsert")
+
+    if result is not None:
+        print(f"[+] MongoDB: Client {client_id} join saved ({joined_time_str})")
+    else:
+        print(f"[-] MongoDB: Failed to save join for {client_id}")
 
     # --- Save to local JSON ---
     try:
@@ -109,23 +118,22 @@ def log_user_registration(client_id, ip):
                 except (json.JSONDecodeError, FileNotFoundError):
                     log_data = []
 
-        # Update existing entry or append new one
         existing = next((x for x in log_data if x.get("client_id") == client_id), None)
         if existing:
-            existing["ip"]              = ip
-            existing["joined_time"]     = joined_time_str
+            existing["ip"]               = ip
+            existing["joined_time"]      = joined_time_str
             existing["disconnected_time"] = None
         else:
             log_data.append({
-                "client_id":          client_id,
-                "ip":                 ip,
-                "joined_time":        joined_time_str,
-                "disconnected_time":  None
+                "client_id":         client_id,
+                "ip":                ip,
+                "joined_time":       joined_time_str,
+                "disconnected_time": None
             })
 
         with open(USER_LOG_FILE, 'w') as f:
             json.dump(log_data, f, indent=4)
-        print(f"[#] Logged user {client_id} join to {USER_LOG_FILE}")
+        print(f"[#] JSON: Client {client_id} join saved")
     except Exception as e:
         print(f"[-] Error saving to json: {e}")
 
@@ -135,21 +143,17 @@ def log_user_disconnection(client_id):
     disconnected_at = datetime.now(timezone.utc)
     disconnected_time_str = _fmt_time(disconnected_at)
 
-    # --- Update MongoDB ---
-    if MONGO_ENABLED and clients_collection is not None:
-        try:
-            clients_collection.update_one(
-                {"client_id": client_id},
-                {
-                    "$set": {
-                        "disconnected_at":   disconnected_at,
-                        "disconnected_time": disconnected_time_str
-                    }
-                }
-            )
-            print(f"[x] MongoDB: Client {client_id} disconnected at {disconnected_time_str}")
-        except Exception as e:
-            print(f"[-] MongoDB disconnect write error: {e}")
+    # --- Update MongoDB (always attempts, own connection) ---
+    result = save_to_mongodb({
+        "client_id":         client_id,
+        "disconnected_at":   disconnected_at,
+        "disconnected_time": disconnected_time_str
+    }, operation="update")
+
+    if result is not None:
+        print(f"[x] MongoDB: Client {client_id} disconnect saved ({disconnected_time_str})")
+    else:
+        print(f"[-] MongoDB: Failed to save disconnect for {client_id}")
 
     # --- Update local JSON ---
     try:
@@ -172,9 +176,10 @@ def log_user_disconnection(client_id):
 
         with open(USER_LOG_FILE, 'w') as f:
             json.dump(log_data, f, indent=4)
-        print(f"[#] Logged user {client_id} disconnect to {USER_LOG_FILE}")
+        print(f"[#] JSON: Client {client_id} disconnect saved")
     except Exception as e:
         print(f"[-] Error saving disconnect to json: {e}")
+
 
 
 def clean_clients():
