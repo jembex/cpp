@@ -13,7 +13,7 @@ try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     # Trigger connection to verify it works
     mongo_client.server_info()
-    db = mongo_client['myProject']
+    db = mongo_client['myclients']
     clients_collection = db['clients']
     MONGO_ENABLED = True
     print("[+] MongoDB connected successfully.")
