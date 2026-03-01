@@ -10,17 +10,17 @@ from werkzeug.utils import secure_filename
 try:
     from pymongo import MongoClient
     MONGO_URI = 'mongodb://jembex:qwerty4747@ac-pkxjbeh-shard-00-00.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-01.lyarq5l.mongodb.net:27017,ac-pkxjbeh-shard-00-02.lyarq5l.mongodb.net:27017/myclients?ssl=true&replicaSet=atlas-l0l26j-shard-0&authSource=admin&retryWrites=true&w=majority&appName=datas'
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    # Trigger connection to verify it works
-    mongo_client.server_info()
+    # Use a longer timeout; pymongo connects lazily on first write (no blocking call here)
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=15000)
     db = mongo_client['myclients']
     clients_collection = db['clients']
     MONGO_ENABLED = True
-    print("[+] MongoDB connected successfully.")
+    print("[+] MongoDB client initialised (will connect on first write).")
 except Exception as _mongo_err:
     MONGO_ENABLED = False
     clients_collection = None
-    print(f"[-] MongoDB connection failed: {_mongo_err}. Falling back to JSON log only.")
+    print(f"[-] MongoDB setup failed: {_mongo_err}. Falling back to JSON log only.")
+
 
 app = Flask(__name__)
 
